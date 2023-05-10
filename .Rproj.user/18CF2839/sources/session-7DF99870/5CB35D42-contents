@@ -1,0 +1,325 @@
+---
+title: "modeling"
+author: "Nick R. Bachelder"
+date: "2023-05-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+library(nflfastR)
+library(lme4)
+library(glmnet)
+library(gt)
+library(gtsummary)
+library(gtExtras)
+library(cfbfastR)
+library(stringdist)
+library(fuzzyjoin)
+library(caret)
+library(xgboost)
+Sys.setenv(CFBD_API_KEY = "sgAiAmHAF7BcbmZlRI0vI4/3IDm7/4D5CtL4xPANWv+L+AaHp0fpygaCwdiyZU7I")
+```
+
+### Step 1: Preseason Projections
+
+# Build Offensive Rigor of Schedule Feature For Each Team From Previous Year:
+
+Inspiration: https://bestballstats.com/2021/01/08/nfl-offensive-and-defensive-ratings/#:~:text=Finally%2C%20offensive%20and%20defensive%20rating,to%2010%20possessions%20per%20game.
+
+Here we run an logistic ANOVA analysis to calculate a random effect for each defense on the average yards given up per drive in a each game.
+
+```{r, message = FALSE}
+get_defensive_strength_for_year <- function(year) {
+  # Get play by play for year
+  pbp <- nflfastR::load_pbp(year)
+  
+  # Calculate average years lost per drive for each defense over year
+  previous_year_training <- pbp %>%
+    filter(season_type == "REG") %>%
+    dplyr::select(defteam, game_id, drive, yards_gained) %>% 
+    filter(complete.cases(.)) %>%
+    unique() %>%
+    group_by(defteam, game_id, drive) %>%
+    summarise(yards_lost_on_drive = sum(yards_gained)) %>%
+    ungroup() %>%
+    group_by(defteam, game_id) %>%
+    summarise(avg_yards_lost_per_drive = mean(yards_lost_on_drive)) %>%
+    ungroup()
+  
+  # Train Simple Random Effect Model for defensive team on average yards lost per drive
+  def_stringth_fit <- lmer(avg_yards_lost_per_drive ~ (1 | defteam), data=previous_year_training, REML=T)
+  
+  # Get random effect for each team
+  def_strength_ratings <- ranef(def_stringth_fit)$defteam %>%
+    tibble::rownames_to_column() %>% dplyr::rename(team = rowname, rating = "(Intercept)")
+  return(def_strength_ratings)
+}
+
+
+get_defensive_strength_for_year(2017)
+```
+Now to account for a given teams upcoming season rigor of offensive schedule...
+
+```{r, message = FALSE}
+get_offensive_rigor_of_schedule <- function(year) {
+  # Get defensive rigors for previous year
+  def_strength_ratings <- get_defensive_strength_for_year(year - 1)
+  
+  # Get for each matchup in upcoming year join each team with their previous years defensive rating
+  this_season_games_and_def_rankings <- nflfastR::load_pbp(year) %>% 
+    filter(season_type == "REG") %>%
+    dplyr::select(game_id, week, home_team, away_team) %>%
+    unique() %>%
+    left_join(def_strength_ratings %>% dplyr::rename(home_team = team, home_def_rating = rating), 
+              by = "home_team") %>%
+    left_join(def_strength_ratings %>% dplyr::rename(away_team = team, away_def_rating = rating), 
+              by = "away_team")
+  
+  # For each team find the mean opposing defensive rating and set as team offensive schedule rigor
+  all_teams <- this_season_games_and_def_rankings$home_team %>% unique()
+  team_offensive_schedule_rigor <- do.call(rbind, lapply(all_teams, function(team_abb) {
+    this_season_games_and_def_rankings %>% filter(home_team == team_abb | away_team == team_abb) %>%
+      mutate(team = team_abb, 
+             opposing_def_rating = ifelse(home_team == team_abb,
+                                          away_def_rating, 
+                                          home_def_rating)) %>%
+      dplyr::select(team, opposing_def_rating) %>%
+      group_by(team) %>% summarise(team_offensive_schedule_rigor = mean(opposing_def_rating)) %>%
+      ungroup()
+  }))
+  return(team_offensive_schedule_rigor)
+}
+
+get_offensive_rigor_of_schedule(2017)
+```
+
+
+
+```{r, message = FALSE}
+get_training_and_labels_rookie <- function(years) {
+  features <- vector("list", length = length(years))
+  for (year in years) {
+    true_fantasy_totals_all_position <- nflfastR::load_player_stats(year) %>%
+      mutate(player_id = paste0(player_display_name, position)) %>%
+      group_by(player_id) %>% mutate(total_fantasy_points = sum(fantasy_points)) %>% ungroup() %>%
+      dplyr::select(player_id, player_display_name, total_fantasy_points) %>% unique()
+    feature <- cfbd_draft_picks(year = year) %>% 
+      mutate(position = case_when(position == "Quarterback" ~ "QB",
+                                   position == "Running Back" ~ "RB",
+                                   position == "Wide Receiver" ~ "WR",
+                                   position == "Tight End" ~ "TE",
+                                   TRUE ~ as.character(NA))) %>%
+      filter(!is.na(position)) %>%
+      mutate(player_id = paste0(name, position)) %>%
+      dplyr::select(player_id, name, position, height, weight, overall, nfl_team, pre_draft_grade) %>%
+      stringdist_left_join(true_fantasy_totals_all_position, 
+                      by = 'player_id', method = "jw", max_dist = 0.1) %>%
+      mutate(year = year)
+    features[[year - min(years) + 1]] <- feature
+    Sys.sleep(2)
+  }
+  ret <- do.call(rbind, features) %>% 
+    dplyr::select(year, name, position, height, weight, overall, pre_draft_grade, nfl_team, total_fantasy_points) %>%
+    mutate_if(is.numeric, function(x){ifelse(is.na(x), 0, x)}) %>% # assign players that did not play with 0 fantasy points
+    dplyr::select(position, height, weight, pre_draft_grade, total_fantasy_points) %>%
+    mutate(position = as.factor(position))
+
+  return(ret)
+}
+
+get_training_and_labels <- function(years, pos) {
+  features <- vector("list", length = length(years))
+  # For each year requested...
+  for (year in years) {
+    # Get true fantasy points for year via nflfastr (to have training data before 2020)
+    true_fantasy_totals_all_position <- nflfastR::load_player_stats(year) %>% dplyr::select(player_id, fantasy_points) %>%
+      group_by(player_id) %>% summarise(total_fantasy_points = sum(fantasy_points)) %>% ungroup()
+    
+    # get last year training data
+    last_year_player_stats <- nflfastR::load_player_stats(year - 1) 
+    
+    # Get rigor of offensive schedules for year
+    offensive_schedule_rigors <- get_offensive_rigor_of_schedule(year)
+    
+    # set needed features for each position
+    if (pos == "QB") {
+      needed_features <- c('player_id', 'completions', 'attempts', 'passing_yards',
+                  'passing_tds', 'interceptions', 'sacks', 'sack_fumbles', 'passing_air_yards',
+                  'passing_yards_after_catch', 'passing_first_downs', 'rushing_yards', 'rushing_tds',
+                  'rushing_fumbles', 'rushing_first_downs', 'rushing_epa', 'fantasy_points', 'team_offensive_schedule_rigor')
+    }
+    if (pos == "RB") {
+      needed_features <- c('player_id', 'rushing_yards', 'rushing_tds',
+                  'rushing_fumbles', 'rushing_first_downs', 'receptions', 'targets', 'receiving_yards', 
+                  'receiving_tds', 'receiving_yards_after_catch', 'fantasy_points', 'air_yards_share', 'team_offensive_schedule_rigor')
+    }
+    if (pos == "WR") {
+      needed_features <- c('player_id', 'receptions', 'targets', 'receiving_yards', 'receiving_tds', 'receiving_fumbles', 'receiving_air_yards',
+                  'receiving_yards_after_catch', 'receiving_first_downs', 'fantasy_points', 'team_offensive_schedule_rigor')
+    }
+    if (pos == "TE") {
+      needed_features <- c('player_id', 'receptions', 'targets', 'receiving_yards', 'receiving_tds', 'receiving_fumbles', 'receiving_air_yards',
+                  'receiving_yards_after_catch', 'receiving_first_downs', 'fantasy_points', 'team_offensive_schedule_rigor')
+    }
+
+    # Get player features from previous year and join with schedule rigors & labels
+    feature <- last_year_player_stats %>%
+      filter(position == pos, season_type == "REG") %>%
+      left_join(offensive_schedule_rigors %>% dplyr::rename(recent_team = team), by = "recent_team") %>%
+      dplyr::select(needed_features) %>%
+      mutate_if(is.numeric, function(x) { ifelse(is.na(x), 0, x)}) %>% # fill na (meaning no stat) to 0, for completions etc
+      group_by(player_id) %>% 
+      summarise(across(
+        .cols = is.numeric,
+        .fns = list(Mean = mean, SD = sd, Sum = sum), na.rm = TRUE, 
+        .names = "{col}_{fn}"
+      )) %>%
+      ungroup() %>%
+      left_join(true_fantasy_totals_all_position, by = "player_id") %>%
+      dplyr::select(-player_id, -team_offensive_schedule_rigor_SD) %>%
+      mutate_if(is.numeric, function(x) { ifelse(is.na(x), 0, x)}) # fill sd of NA with 0
+    features[[year - min(years) + 1]] <- feature
+  }
+  return(do.call(rbind, features))
+}
+
+training_QB <- get_training_and_labels(years = seq(2017, 2020), pos = "QB")
+training_RB <- get_training_and_labels(years = seq(2017, 2020), pos = "RB")
+training_WR <- get_training_and_labels(years = seq(2017, 2020), pos = "WR")
+training_TE <- get_training_and_labels(years = seq(2017, 2020), pos = "TE")
+training_rookie <- get_training_and_labels_rookie(years= seq(2005, 2022))
+```
+
+```{r}
+plot(training_rookie$total_fantasy_points)
+```
+
+While we can assume that each players true fantasy points is normally distributed around the model prediction, we should NOT assume constant variance of the model for all player as this will not hold.
+
+```{r}
+moder <- function(my_data) {
+  # create a data matrix for the predictors (i.e. all columns except total_fantasy_points)
+  my_data <- my_data %>%
+    mutate(total_fantasy_points = ifelse(total_fantasy_points == 0, 1, total_fantasy_points))
+  
+  # create the outcome variable vector
+  outcome <- log(my_data$total_fantasy_points)
+  
+  # set up the cross-validation scheme
+  folds <- createFolds(outcome, k = 10, list = TRUE, returnTrain = FALSE)
+  
+  # perform cross-validated hyperparameter tuning
+  custom <- trainControl(
+    method = "cv",
+    number = 10,
+    verboseIter = FALSE,
+    index = folds,
+    allowParallel = TRUE
+  )
+  
+  en <- train(x = predictors,
+              y = outcome,
+            method='glmnet',
+            tuneGrid =expand.grid(alpha=seq(0,1,length=10),
+                                  lambda = seq(0.0001,0.2,length=5)),
+            trControl=custom)
+  return(en)
+}
+
+rb_fit <- moder(training_RB)
+rb_fit
+```
+
+```{r}
+booster <- function(my_data) {
+  # create a data matrix for the predictors (i.e. all columns except total_fantasy_points)
+  my_data <- my_data %>%
+    mutate(total_fantasy_points = ifelse(total_fantasy_points <= 0, 0.5, total_fantasy_points))
+  
+  predictors <- model.matrix(~.-total_fantasy_points - 1, data = my_data)
+  
+  # create the outcome variable vector
+  outcome <- log(my_data$total_fantasy_points)
+  
+  # set up the cross-validation scheme
+  folds <- createFolds(outcome, k = 10, list = TRUE, returnTrain = FALSE)
+  
+  # set up the hyperparameter grid for tuning
+  param_grid <- expand.grid(
+    nrounds = c(50, 100),
+    eta = c(0.1, 0.3),
+    max_depth = c(3, 6),
+    gamma = c(0, 0.1),
+    colsample_bytree = c(0.5, 0.7),
+    min_child_weight = c(1, 3),
+    subsample = c(0.5, 0.7)
+  )
+  
+  # perform cross-validated hyperparameter tuning
+  xgb_train_control <- trainControl(
+    method = "cv",
+    number = 5,
+    verboseIter = FALSE,
+    index = folds,
+    allowParallel = TRUE
+  )
+  
+  xgb_tune <- train(
+    x = predictors,
+    y = outcome,
+    method = "xgbTree",
+    trControl = xgb_train_control,
+    tuneGrid = param_grid,
+    metric = "RMSE",
+    verbosity = 0
+  )
+  
+  # calculate the average cross-validated RMSE for the final model
+  test_rmse <- mean(xgb_tune$resample$RMSE)
+  test_r2 <- mean(xgb_tune$resample$Rsquared)
+  
+  # print the feature importance
+  importance_matrix <- xgb.importance(names(predictors), model = xgb_tune$finalModel)
+  xgb.plot.importance(importance_matrix, xlab = "Importance", cex.lab = 1.5)
+  
+  # train a final XGBoost model using the best hyperparameters
+  xgb_final <- xgboost(
+    data = predictors,
+    label = outcome,
+    nrounds = xgb_tune$bestTune$nrounds,
+    eta = xgb_tune$bestTune$eta,
+    max_depth = xgb_tune$bestTune$max_depth,
+    objective = "reg:squarederror",
+    verbose = FALSE
+  )
+  
+  return(list(model = xgb_final, test_rmse = test_rmse, test_r2 = test_r2))
+}
+
+qb_fit <- booster(training_QB)
+rb_fit <- booster(training_RB)
+wr_fit <- booster(training_WR)
+te_fit <- booster(training_TE)
+rookie_fit <- booster(training_rookie)
+
+print(paste0("The test RMSE for QBs is: ", qb_fit$test_rmse, ", The test R^2 for QBs is: ", qb_fit$test_r2))
+print(paste0("The test RMSE for RBs is: ", rb_fit$test_rmse, ", The test R^2 for RBs is: ", rb_fit$test_r2))
+print(paste0("The test RMSE for WRs is: ", wr_fit$test_rmse, ", The test R^2 for WRs is: ", wr_fit$test_r2))
+print(paste0("The test RMSE for TEs is: ", te_fit$test_rmse, ", The test R^2 for TEs is: ", te_fit$test_r2))
+print(paste0("The test RMSE for rookies is: ", rookie_fit$test_rmse, ", The test R^2 for rookies is: ", rookie_fit$test_r2))
+```
+
+Look at residuals
+
+```{r}
+true <- log(training_TE$total_fantasy_points)
+predicted <- predict(te_fit$model, model.matrix(~.-total_fantasy_points - 1, data = training_TE))
+residuals <- predicted - true
+plot(true, residuals)
+```
+

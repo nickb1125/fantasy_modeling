@@ -1,0 +1,332 @@
+---
+title: "nick_entry"
+author: "Nick R. Bachelder"
+date: "2023-05-03"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(here)
+library(nflfastR)
+library(lme4)
+library(glmnet)
+library(gt)
+library(gtsummary)
+library(gtExtras)
+library(cfbfastR)
+library(stringdist)
+library(fuzzyjoin)
+library(caret)
+library(xgboost)
+Sys.setenv(CFBD_API_KEY = "sgAiAmHAF7BcbmZlRI0vI4/3IDm7/4D5CtL4xPANWv+L+AaHp0fpygaCwdiyZU7I")
+```
+
+
+
+
+# BBM Data
+
+```{r}
+fantasy_points_loader <- function(years) {
+  ret <- lapply(years, function(year) {
+    true_fantasy_totals <- nflfastR::load_player_stats(year) %>%
+    mutate(player_display_name = gsub("[.]", "", player_display_name)) %>%
+    mutate(player_display_name = case_when(player_display_name == "Gabe Davis" ~ "Gabriel Davis",
+                                           player_display_name == "Josh Palmer" ~ "Joshua Palmer",
+                                           TRUE ~ player_display_name)) %>%
+    mutate(position_group = case_when(player_display_name == "Juwan Johnson" ~ "WR",
+                                      TRUE ~ position_group)) %>%
+      mutate(player_id = paste0(player_display_name, position_group)) %>%
+      group_by(player_id) %>% mutate(total_fantasy_points = sum(fantasy_points)) %>% ungroup() %>%
+      dplyr::select(player_id, player_display_name, total_fantasy_points) %>% unique()
+    return(true_fantasy_totals)
+  })
+  names(ret) <- paste0("s", years)
+  return(ret)
+}
+fantasy_points_list <- fantasy_points_loader(years = c(2021, 2022))
+
+# Read data 2021
+regular_21 <- do.call(rbind, lapply(paste0(here::here("data/2021/regular_season/part_0"), seq(0, 5), ".csv"), read.csv)) %>%
+    mutate(player_name = gsub("[.]", "", player_name)) %>%
+    mutate(player_id = paste0(player_name, position_name)) 
+
+# Add true fantasy data
+regular_21 <- regular_21 %>%
+    left_join(as.data.frame(fantasy_points_list["s2021"][[1]]), by = "player_id") %>%
+    # filter(is.na(total_fantasy_points)) # Check to make sure that all players with NA were injured all season
+    mutate(total_fantasy_points = ifelse(is.na(total_fantasy_points), 0, total_fantasy_points)) %>%
+    dplyr::select(playoff_team, draft_id, draft_time, tournament_entry_id, overall_pick_number, pick_order, 
+                  player_name, position_name, projection_adp, total_fantasy_points)
+
+
+# Calculate who made it how far in the playoffs
+post_21 <- do.call(rbind, lapply(paste0(here::here("data/2021/post_season/"), 
+                                        c("semifinals", "quarterfinals", "finals"), ".csv"), read.csv))
+
+max_rounds_21 <- post_21 %>% dplyr::select(tournament_entry_id, tournament_round_number, roster_points) %>%
+  unique() %>% group_by(tournament_entry_id) %>%
+  summarise(max_round = max(tournament_round_number)) %>%
+  ungroup()
+
+
+post_21 %>% dplyr::select(tournament_entry_id, tournament_round_number) %>%
+  filter(tournament_round_number == 4) %>% unique()
+  
+
+dat_21 <- regular_21 %>% left_join(max_rounds_21, by = "tournament_entry_id") %>%
+  mutate(max_round = ifelse(is.na(max_round), 1, max_round))
+  
+```
+
+
+### Step 1: Draft Strategy
+
+
+NOTE: WE WANT TO USE DISTRIBUTIONS OF PLAYERS SO MC SIMULATE A BUNCH OF POSSIBLE TABLES BEFORE HAND AND USE ALL OF THEM TO GET ESTIMATE FOR EACH PLAYER EACH TURN
+
+$$\text{NExRep}_{POS} \text{ (Next Round Expected Positional Value Lost)} = E[\text{Player Season Fantasy Points}]  - E[\text{Maximum projected fantasy points at position next turn}] $$
+
+$$= E[\text{Player Season Fantasy Points}] - \sum^{\substack{p_i \in\text{All remaining}\\ \text{players in position}}} [E[p_i \text{ Season Fantasy Points}] \cdot P(p_i \text{ has highest expected positional fantasy points next turn})]$$
+
+$$\text{where } P(p_i \text{ has highest expected positional fantasy points next turn}) = P(p_i \text{ unpicked next turn}) \cdot P(\text{All players with higher projection picked by next turn})$$
+
+Ideally, we want to pick the player with the highest NExRep on any given pick turn.
+Lets dive into how we can accomplish calculating NExRep...
+
+$$\text{Draft Position} \sim  Pois(\lambda = ADP)$$ 
+
+Lets check this assumption...
+```{r}
+# Get plot of theoretical draft pick means and quantiles under poisson distribution as well as true picks from 2021
+regular_21 %>% mutate(draft_time = as.Date(draft_time)) %>%
+  filter(draft_time == "2021-08-28") %>%
+  dplyr::select(overall_pick_number, projection_adp) %>%
+  filter(projection_adp < 75, projection_adp != 0, overall_pick_number != 0) %>%
+  mutate(projection_adp = floor(projection_adp)) %>%
+  group_by(projection_adp) %>%
+  mutate(number_picks_at_adp = n()) %>%
+  ungroup() %>%
+  mutate(lower_mean_CI = projection_adp - 1.96*sqrt(projection_adp / number_picks_at_adp),
+         upper_mean_CI = projection_adp + 1.96*sqrt(projection_adp / number_picks_at_adp),
+         lower_quantile = qpois(p = 0.05, lower.tail = TRUE, lambda = projection_adp),
+         upper_quantile = qpois(p = 0.975, lower.tail = TRUE, lambda = projection_adp)) %>%
+  ggplot() +
+  geom_boxplot(aes(x = projection_adp, y = overall_pick_number, group = projection_adp), outlier.shape = NA) +
+  ylim(0, 100) + 
+  geom_ribbon(aes(x = projection_adp, y = overall_pick_number, 
+                  ymin = lower_mean_CI, ymax = upper_mean_CI, fill = "Theoretical Poisson Mean 95% CI"), alpha = 0.3) +
+  geom_ribbon(aes(x = projection_adp, y = overall_pick_number, 
+                  ymin = lower_quantile, ymax = upper_quantile, fill ='Theoretical Poisson 95% Quantiles'), alpha = 0.3)
+```
+
+Since we can approximate a draft pick position as poisson distributed with the mean (and variance) equal to ADP, we can easily calculate the probability that a player will be picked in x turns.
+
+```{r}
+get_prob_player_picked_for_entire_draft<- function(player_adp, num_picks_in_draft) {
+  prob = lapply(seq(1, num_picks_in_draft), ppois, lambda = player_adp) %>% unlist()
+  return(prob)
+}
+
+get_prob_player_picked_for_entire_draft(player_adp = 10, num_picks_in_draft = 210)
+```
+
+
+```{r}
+draft_board <- dat_21 %>% filter(draft_id == "00009a0e-b1a6-42e0-b1cf-3f884cc0999b")
+calculate_player_round_pick_probs <- function(draft_board) {
+  max_pick <- max(draft_board$overall_pick_number)
+  all_turns <- sapply(draft_board$projection_adp, get_prob_player_picked_for_entire_draft, num_picks_in_draft = max_pick) %>% data.frame() %>%
+      `colnames<-`(draft_board$player_name) %>% 
+      gather(key = "player_name", value = "prob_picked") %>%
+      mutate(theoretical_pick_number = rep(seq(1, max_pick), length(draft_board$player_name)))
+  return(all_turns)
+}
+
+calculate_turns_until_next_pick <- function(current_turn, num_in_draft) {
+  snake_direction <- case_when((current_turn / num_in_draft) %% 2 == 1 ~ "up",
+                               (current_turn / num_in_draft) %% 2 == 0 ~ "down",
+                               ((floor(current_turn / num_in_draft) %% 2) == 0) & !((current_turn / num_in_draft) %% 2  %in% c(0, 1)) ~ "up", 
+                               (floor(current_turn / num_in_draft) %% 2) == 1  & !((current_turn / num_in_draft) %% 2  %in% c(0, 1)) ~ "down")
+  pick_order <- case_when((snake_direction == "up") & ((current_turn %% num_in_draft) != 0) ~ (current_turn %% num_in_draft), 
+                          (snake_direction == "down") & ((current_turn %% num_in_draft) != 0) ~ 1+(num_in_draft - (current_turn %% num_in_draft)),
+                          (snake_direction == "up") & ((current_turn %% num_in_draft) == 0) ~ as.numeric(num_in_draft),
+                          (snake_direction == "down") & ((current_turn %% num_in_draft) == 0) ~ 1)
+  n_until_next_turn <- case_when(snake_direction == "up" ~ 2*(num_in_draft - pick_order),
+                                 snake_direction == "down" ~ (2*pick_order)-2)
+  if (n_until_next_turn == 0) {
+    n_until_next_turn = 22 # to account for the fact that when we have two picks in a row we should try to get value until next TRUE pick
+  }
+  return(n_until_next_turn)
+}
+
+player_pick_probs <- calculate_player_round_pick_probs(draft_board)
+
+# player_df must contain columns projection_adp, total_fantasy_points
+calculate_NExRep_VOPR <- function(draft_board, current_turn, player_pick_probs) {
+  
+  # merge with draft board and calculate expected max positional values for next 50 turns
+  with_probs_picked <- draft_board %>% 
+    dplyr::select(tournament_entry_id, pick_order, overall_pick_number, player_name, projection_adp, total_fantasy_points, position_name) %>%
+    # merging by player name is ok here since one df if derived from the other
+    right_join(player_pick_probs, by = c("player_name")) %>% 
+    filter(overall_pick_number >= current_turn) %>%
+    group_by(theoretical_pick_number, position_name) %>%
+    arrange(theoretical_pick_number, position_name, desc(total_fantasy_points)) %>%
+    mutate(prob_all_higher_ranked_positional_players_picked = cumprod(dplyr::lag(prob_picked, default = 1))) %>%
+    ungroup() %>%
+    mutate(prob_player_is_best_at_pos= (1-prob_picked)*prob_all_higher_ranked_positional_players_picked) %>%
+    mutate(player_expected_value_if_best = total_fantasy_points*prob_player_is_best_at_pos) %>% 
+    group_by(theoretical_pick_number, position_name) %>%
+    mutate(expected_max_value_at_position = sum(player_expected_value_if_best)) %>% 
+    ungroup()
+  
+  # calculate nexrep for the next 50 turns
+  calc_vopr_NExRep <- with_probs_picked %>%
+    mutate(NExRep = total_fantasy_points - expected_max_value_at_position) %>%
+    group_by(theoretical_pick_number, position_name) %>%
+    mutate(NExRep_player = player_name[which.max(total_fantasy_points)],
+           positional_NExRep = max(total_fantasy_points) - expected_max_value_at_position) %>%
+    ungroup() %>%
+    group_by(theoretical_pick_number) %>%
+    mutate(NExRep_positional_selection = position_name[which.max(positional_NExRep)][1],
+           NExRep_player_selection = player_name[which.max(positional_NExRep)][1],
+           best_nexrep = max(positional_NExRep)) %>%
+    ungroup()
+    
+  return(calc_vopr_NExRep)
+}
+
+draft_board <- dat_21 %>% filter(draft_id == "00009a0e-b1a6-42e0-b1cf-3f884cc0999b")
+calculate_NExRep_VOPR(draft_board = draft_board, current_turn = 10, player_pick_probs = player_pick_probs) %>%
+  filter(position_name == "TE", theoretical_pick_number == 10) 
+```
+
+```{r}
+draft_board <- dat_21 %>% filter(draft_id == "00009a0e-b1a6-42e0-b1cf-3f884cc0999b")
+analyzed_round <- calculate_NExRep_VOPR(draft_board = draft_board, current_turn = 11, player_pick_probs = player_pick_probs)
+plot_NExRep_by_turn <- function(analyzed_round, current_turn) {
+  num_in_draft = max(analyzed_round$pick_order)
+  next_turn_in = calculate_turns_until_next_pick(current_turn = current_turn, num_in_draft = 12)
+  
+  best_next_turn_NExRep <- max(analyzed_round$positional_NExRep[which(analyzed_round$theoretical_pick_number == current_turn + next_turn_in)])
+  best_next_turn_NExRep_player <- (analyzed_round[which(analyzed_round$theoretical_pick_number == current_turn + next_turn_in),])$NExRep_player_selection[1]
+  best_next_turn_NExRep_position <- (analyzed_round[which(analyzed_round$theoretical_pick_number == current_turn + next_turn_in),])$NExRep_positional_selection[1]
+  max_y_axis <- max(analyzed_round$positional_NExRep[which(analyzed_round$theoretical_pick_number == 50)])
+  
+  analyzed_round %>% 
+    dplyr::select(theoretical_pick_number, position_name, positional_NExRep) %>% 
+    unique() %>% 
+    ggplot(aes(x = theoretical_pick_number, y = positional_NExRep)) +
+    geom_line(aes(color = position_name), size = 1.5) + 
+    theme_classic() +
+    geom_segment(aes(x = current_turn + next_turn_in, xend=current_turn + next_turn_in, 
+                 y = -Inf, yend=best_next_turn_NExRep), colour = "black", size = 0.2) +
+    geom_segment(aes(x = -Inf, xend=current_turn + next_turn_in, 
+                 y = best_next_turn_NExRep, yend=  best_next_turn_NExRep), colour = "black", size = 0.2) +
+    geom_label(aes(x = current_turn + 25, y = max_y_axis + + (max_y_axis / 5), 
+                  label = paste0("NExRep Suggests Pick of Best Available ", best_next_turn_NExRep_position, ": ", best_next_turn_NExRep_player)),
+              color = "black", size = 3.5) +
+    geom_label(aes(x = current_turn + next_turn_in, y = best_next_turn_NExRep + 5, 
+                  label = paste0("NExRep for next turn in ", next_turn_in, " picks")), size = 3.5) +
+    xlab("Overall Pick") +
+    ylab("Expected Loss in Positional Value (Max NExRep)") +
+    ggtitle("Expected Loss in Positional Value Over Next 50 Picks") + 
+    xlim(current_turn, current_turn + 50) +
+    ylim(0, max_y_axis + (max_y_axis / 5))
+}
+
+plot_NExRep_by_turn(analyzed_round = analyzed_round, current_turn = 11)
+```
+
+```{r}
+draft_board <- dat_21 %>% filter(draft_id == "00009a0e-b1a6-42e0-b1cf-3f884cc0999b")
+analyzed_round <- calculate_NExRep_VOPR(draft_board = draft_board, current_turn = 11, player_pick_probs = player_pick_probs)
+summarize_nexrep_entire_draft_performance <- function(draft_board) {
+  max_draft_pick = max(draft_board$overall_pick_number)
+  num_players = max(draft_board$pick_order)
+  player_pick_probs <- calculate_player_round_pick_probs(draft_board)
+  
+  # calculate n until next turn for each turn in draft
+  current_turns <- as.numeric(seq(1, max_draft_pick))
+  n_until_vector <- lapply(current_turns, calculate_turns_until_next_pick, num_in_draft = num_players) %>% unlist()
+  
+  # zip current pick with turns until next turn
+  curr_and_next_zip <- mapply(c, current_turns, n_until_vector, SIMPLIFY = FALSE)
+
+  # filter to analyzed to only occured with proper nextreps
+  all_picks <- lapply(curr_and_next_zip, function(x) {
+    calculate_NExRep_VOPR(draft_board = draft_board, current_turn = as.numeric(x[1]), player_pick_probs = player_pick_probs) %>% 
+      filter(overall_pick_number == as.numeric(x[1]), theoretical_pick_number == as.numeric(x[2])) %>%
+      dplyr::select(tournament_entry_id, overall_pick_number, player_name, projection_adp, NExRep, NExRep_player_selection, best_nexrep)})
+  return(do.call(rbind, all_picks))
+}
+
+draft_summarized <- summarize_nexrep_entire_draft_performance(draft_board)
+
+get_nexrep_means <- function(draft_summarized) {
+  draft_summarized %>%
+    mutate(diff_in_best_nexrep_to_true_nexrep = NExRep - best_nexrep)
+    group_by(tournament_entry_id) %>%
+    summarise(mean_NExRep_diff = mean(diff_in_best_nexrep_to_true_nexrep)) %>%
+      ungroup()
+}
+
+draft_summarized
+```
+
+
+```{r}
+get_nexrep_diff_means <- function(draft_summarized) {
+  draft_summarized %>%
+    mutate(diff_in_best_nexrep_to_true_nexrep = NExRep - best_nexrep) %>%
+    group_by(tournament_entry_id) %>%
+    summarise(mean_NExRep_diff = mean(diff_in_best_nexrep_to_true_nexrep)) %>%
+      ungroup() %>%
+    mutate(nexrep_rank = row_number(mean_NExRep_diff))
+}
+
+get_nexrep_diff_means(draft_summarized) 
+```
+
+```{r}
+# analyze 100 randomly sampled full drafts
+
+draft_id_sample <- sample(dat_21$draft_id, 100, replace = FALSE)
+```
+
+
+
+Lets analyze a random draft from BBMII with NExRep. Since the season has past we can calculate the TRUE maximum NExRep value pick for each player pick. We can create a metric called "Percent of Maximum NExRep." This is equal to the players true pick and their NExRep value compared to the maximum NExRep value the player could have gotten with their pick.  
+
+
+
+
+Clearly, NExRep preforms extremely well. We can use the NExRep method to make a "perfect draft" where all 12 drafters are drafting with the NExRep strategy. This would make the course of picks deterministic. We can use this "ideal" draft to compare to the millions of drafts recorded in the BBM data to identify where drafters went classically wrong.
+
+
+```{r}
+hm <-  nflfastR::load_player_stats(2021) %>%
+    mutate(player_display_name = gsub("[.]", "", player_display_name)) %>%
+    mutate(player_display_name = case_when(player_display_name == "Gabe Davis" ~ "Gabriel Davis",
+                                           player_display_name == "Josh Palmer" ~ "Joshua Palmer",
+                                           TRUE ~ player_display_name)) %>%
+    mutate(position_group = case_when(player_display_name == "Juwan Johnson" ~ "WR",
+                                      TRUE ~ player_display_name)) %>%
+      mutate(player_id = paste0(player_display_name, position_group)) %>%
+      group_by(player_id) %>% mutate(total_fantasy_points = sum(fantasy_points)) %>% ungroup() %>%
+      dplyr::select(player_id, position_group, player_display_name, total_fantasy_points) %>% unique()
+
+hm %>%
+  filter(grepl("McCaffrey", player_display_name))
+
+```
+
+
+Now, you might think - wow thats a lot of math to do during a draft, I think I'll stick to anchor RB and let this kid be happy his impractical matrix math theoretically could win most often. If you're one of those people go check out my shiny app - where you can follow along with your own draft in real time and get the top NExReps for each pick! It's free I promise.
+
+
